@@ -1,0 +1,210 @@
+"""
+modules/phone_intelligence.py
+-----------------------------
+Module 4 - Phone Intelligence Lookup.
+
+Takes a phone number and returns a defensive risk assessment:
+
+    * validity + formatting (via the `phonenumbers` library)
+    * carrier and region/location (offline, from phonenumbers metadata)
+    * a trust score (0-100, higher = safer) and spam/scam status
+    * a scam category guess
+    * clear advice: Answer / Investigate / Block / Report
+
+Live reputation can optionally come from NumVerify (validation) but spam
+scoring here is heuristic + demo data, since most reliable spam feeds are paid.
+When no keys are present the module runs fully in demo mode.
+
+This module NEVER places calls or texts. It only analyzes the number string.
+"""
+
+import hashlib
+
+import requests
+
+from utils.config import config
+from utils.validators import clean_input, is_valid_phone
+
+# phonenumbers is a pure-Python library (Google's libphonenumber port).
+try:
+    import phonenumbers
+    from phonenumbers import carrier, geocoder, timezone as pn_timezone
+    _HAS_PN = True
+except ImportError:  # pragma: no cover - handled gracefully in UI
+    _HAS_PN = False
+
+# Demo 'known scam' numbers so the module clearly demonstrates a bad verdict.
+_DEMO_SCAM = {"+18005551234", "+19005550000", "+14085550199"}
+_DEMO_SPAM = {"+18885550100", "+441234567890"}
+
+SCAM_CATEGORIES = [
+    "Robocall / Auto-dialer", "Tech-support scam", "IRS / tax scam",
+    "Bank impersonation", "Package delivery scam", "Prize / lottery scam",
+    "Debt collection scam",
+]
+
+
+def lookup_phone(raw_number: str, default_region: str = "US") -> dict:
+    """
+    Main entry point. Validates and parses the number, gathers offline metadata,
+    then assigns a trust score and advice (live or demo).
+    """
+    number = clean_input(raw_number)
+    if not number:
+        return {"error": "Please enter a phone number."}
+
+    if not is_valid_phone(number):
+        return {"error": "That doesn't look like a valid phone number."}
+
+    parsed_info = _parse_number(number, default_region)
+    if parsed_info.get("error"):
+        return parsed_info
+
+    e164 = parsed_info["e164"]
+
+    # Decide spam/scam verdict: live NumVerify only validates; spam is heuristic/demo.
+    verdict = _assess_reputation(e164, parsed_info)
+
+    parsed_info.update(verdict)
+    return parsed_info
+
+
+def _parse_number(number: str, default_region: str) -> dict:
+    """Use phonenumbers for validity, carrier, region, and formatting."""
+    if not _HAS_PN:
+        # Minimal fallback if the library isn't installed.
+        return {
+            "input": number,
+            "e164": number if number.startswith("+") else "+" + number.lstrip("+"),
+            "valid": True,
+            "carrier": "Unknown (install 'phonenumbers' for details)",
+            "location": "Unknown",
+            "timezones": [],
+            "line_type": "Unknown",
+        }
+
+    try:
+        proto = phonenumbers.parse(number, default_region)
+    except phonenumbers.NumberParseException as exc:
+        return {"error": f"Could not parse the number: {exc}"}
+
+    if not phonenumbers.is_valid_number(proto):
+        return {"error": "The number failed validation (wrong length or format)."}
+
+    number_type = phonenumbers.number_type(proto)
+    type_map = {
+        phonenumbers.PhoneNumberType.MOBILE: "Mobile",
+        phonenumbers.PhoneNumberType.FIXED_LINE: "Landline",
+        phonenumbers.PhoneNumberType.FIXED_LINE_OR_MOBILE: "Fixed line or mobile",
+        phonenumbers.PhoneNumberType.TOLL_FREE: "Toll-free",
+        phonenumbers.PhoneNumberType.PREMIUM_RATE: "Premium rate",
+        phonenumbers.PhoneNumberType.VOIP: "VoIP",
+    }
+
+    return {
+        "input": number,
+        "e164": phonenumbers.format_number(
+            proto, phonenumbers.PhoneNumberFormat.E164
+        ),
+        "international": phonenumbers.format_number(
+            proto, phonenumbers.PhoneNumberFormat.INTERNATIONAL
+        ),
+        "valid": True,
+        "carrier": carrier.name_for_number(proto, "en") or "Unknown",
+        "location": geocoder.description_for_number(proto, "en") or "Unknown",
+        "timezones": list(pn_timezone.time_zones_for_number(proto)),
+        "line_type": type_map.get(number_type, "Unknown"),
+    }
+
+
+def _assess_reputation(e164: str, info: dict) -> dict:
+    """
+    Assign a spam/scam verdict, trust score, category, and advice.
+    Uses demo lists + heuristics; NumVerify (if configured) confirms validity.
+    """
+    # Optional: confirm line validity via NumVerify (does not provide spam data).
+    if config.has_key("NUMVERIFY_API_KEY"):
+        _numverify_enrich(e164, info)
+
+    low = e164.lower()
+    line_type = info.get("line_type", "")
+
+    # Base score starts trustworthy and drops on risk signals.
+    score = 85
+    reasons = []
+    category = None
+
+    if low in _DEMO_SCAM:
+        score, category = 8, SCAM_CATEGORIES[1]
+        reasons.append("Number appears on a known scam list (demo data).")
+    elif low in _DEMO_SPAM:
+        score, category = 30, SCAM_CATEGORIES[0]
+        reasons.append("Number appears on a known spam list (demo data).")
+    else:
+        # Heuristic signals.
+        digest = int(hashlib.sha256(low.encode()).hexdigest(), 16)
+        if line_type == "Premium rate":
+            score -= 45
+            reasons.append("Premium-rate numbers are frequently used in scams.")
+            category = SCAM_CATEGORIES[5]
+        if line_type == "VoIP":
+            score -= 20
+            reasons.append("VoIP numbers are cheap and disposable, common for spam.")
+        if line_type == "Toll-free":
+            score -= 5
+            reasons.append("Toll-free numbers are often used by mass callers.")
+        # Deterministic demo variation so different numbers show different results.
+        bucket = digest % 100
+        if bucket < 10:
+            score -= 40
+            category = category or SCAM_CATEGORIES[digest % len(SCAM_CATEGORIES)]
+            reasons.append("Community reports (demo) associate this pattern with scams.")
+        elif bucket < 25:
+            score -= 20
+            reasons.append("Some community spam reports (demo) exist for this pattern.")
+
+    score = max(0, min(score, 100))
+
+    # Verdict label + advice.
+    if score < 25:
+        status, advice = "Likely Scam", "Block and report this number. Do not answer or call back."
+    elif score < 50:
+        status, advice = "Likely Spam", "Avoid answering. Consider blocking; investigate before trusting."
+    elif score < 75:
+        status, advice = "Unverified", "Answer with caution or let it go to voicemail; verify the caller."
+    else:
+        status, advice = "Likely Legitimate", "No strong risk signals, but never share sensitive info on unexpected calls."
+
+    if not reasons:
+        reasons.append("No spam or scam reports were found for this number.")
+
+    return {
+        "trust_score": score,
+        "status": status,
+        "scam_category": category or "None identified",
+        "advice": advice,
+        "reasons": reasons,
+        "demo": not config.has_key("NUMVERIFY_API_KEY"),
+    }
+
+
+def _numverify_enrich(e164: str, info: dict):
+    """Optionally confirm carrier/line info via NumVerify. Best-effort only."""
+    try:
+        resp = requests.get(
+            "http://apilayer.net/api/validate",
+            params={
+                "access_key": config.NUMVERIFY_API_KEY,
+                "number": e164,
+                "format": 1,
+            },
+            timeout=config.REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("valid"):
+                info["carrier"] = data.get("carrier") or info.get("carrier")
+                info["location"] = data.get("location") or info.get("location")
+                info["line_type"] = (data.get("line_type") or info.get("line_type")).title()
+    except requests.RequestException:
+        pass  # keep offline metadata on failure
