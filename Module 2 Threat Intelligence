@@ -1,0 +1,310 @@
+"""
+modules/threat_intelligence.py
+------------------------------
+Module 2 - Threat Intelligence Dashboard.
+
+Takes a URL, domain, IP address, or file hash and checks it against public
+threat-intelligence services:
+
+    * VirusTotal   -> URLs, domains, IPs, file hashes
+    * AbuseIPDB    -> IP reputation / abuse reports
+    * URLScan.io   -> URL scanning
+
+If no API keys are configured (or FORCE_DEMO_MODE is on), the module returns
+deterministic MOCK data so the dashboard is fully demonstrable offline. Demo
+results are clearly labelled as such in the UI.
+
+Output shape (dict):
+    indicator, indicator_type, reputation_score (0-100, higher = safer),
+    risk_score (0-100, higher = more dangerous), verdict label,
+    blacklisted (bool), malicious_reports (int), location (str),
+    sources (list of per-service findings), explanation (str), demo (bool)
+"""
+
+import hashlib
+import requests
+
+from utils.config import config
+from utils.validators import detect_indicator_type, clean_input, is_private_ip
+
+
+# ------------------------------------------------------------------ #
+#  Public entry point
+# ------------------------------------------------------------------ #
+
+def lookup_indicator(indicator: str) -> dict:
+    """
+    Main entry point. Detects the indicator type and dispatches to the right
+    lookup path (live API or demo).
+    """
+    indicator = clean_input(indicator)
+    itype = detect_indicator_type(indicator)
+
+    if itype == "unknown":
+        return {
+            "error": "Could not recognize this as a URL, domain, IP, or file hash.",
+            "indicator": indicator,
+        }
+
+    # Warn (but still analyze) on private IPs.
+    private_note = ""
+    if itype == "ip" and is_private_ip(indicator):
+        private_note = "This is a private/internal IP; public threat feeds won't have data."
+
+    # Decide live vs demo per service.
+    use_live = any(
+        config.has_key(k)
+        for k in ("VIRUSTOTAL_API_KEY", "ABUSEIPDB_API_KEY", "URLSCAN_API_KEY")
+    )
+
+    if use_live and not private_note:
+        result = _live_lookup(indicator, itype)
+    else:
+        result = _demo_lookup(indicator, itype)
+
+    if private_note:
+        result["explanation"] = private_note + " " + result.get("explanation", "")
+    return result
+
+
+# ------------------------------------------------------------------ #
+#  Live lookups
+# ------------------------------------------------------------------ #
+
+def _live_lookup(indicator: str, itype: str) -> dict:
+    """Aggregate results from whichever live services have keys."""
+    sources = []
+    malicious_reports = 0
+    location = "Unknown"
+    blacklisted = False
+
+    # --- VirusTotal (covers all indicator types) ---
+    if config.has_key("VIRUSTOTAL_API_KEY"):
+        vt = _query_virustotal(indicator, itype)
+        if vt:
+            sources.append(vt)
+            malicious_reports += vt.get("malicious", 0)
+            blacklisted = blacklisted or vt.get("malicious", 0) > 0
+
+    # --- AbuseIPDB (IP only) ---
+    if itype == "ip" and config.has_key("ABUSEIPDB_API_KEY"):
+        abuse = _query_abuseipdb(indicator)
+        if abuse:
+            sources.append(abuse)
+            malicious_reports += abuse.get("total_reports", 0)
+            location = abuse.get("country", location)
+            blacklisted = blacklisted or abuse.get("abuse_confidence", 0) >= 50
+
+    # --- URLScan (URL only) ---
+    if itype == "url" and config.has_key("URLSCAN_API_KEY"):
+        us = _query_urlscan(indicator)
+        if us:
+            sources.append(us)
+            blacklisted = blacklisted or us.get("malicious", False)
+
+    if not sources:
+        # Keys were set but every call failed/timed out -> fall back to demo.
+        return _demo_lookup(indicator, itype, note="Live lookups failed; showing demo data.")
+
+    return _assemble(indicator, itype, sources, malicious_reports, location,
+                     blacklisted, demo=False)
+
+
+def _query_virustotal(indicator: str, itype: str):
+    """Query the VirusTotal v3 API. Returns a source dict or None on failure."""
+    base = "https://www.virustotal.com/api/v3"
+    headers = {"x-apikey": config.VIRUSTOTAL_API_KEY}
+
+    # Build the correct endpoint for the indicator type.
+    if itype == "ip":
+        endpoint = f"{base}/ip_addresses/{indicator}"
+    elif itype == "domain":
+        endpoint = f"{base}/domains/{indicator}"
+    elif itype == "hash":
+        endpoint = f"{base}/files/{indicator}"
+    else:  # url -> VT needs a URL id (base64, no padding)
+        import base64
+        url_id = base64.urlsafe_b64encode(indicator.encode()).decode().strip("=")
+        endpoint = f"{base}/urls/{url_id}"
+
+    try:
+        resp = requests.get(endpoint, headers=headers, timeout=config.REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        stats = (
+            resp.json()
+            .get("data", {})
+            .get("attributes", {})
+            .get("last_analysis_stats", {})
+        )
+        return {
+            "service": "VirusTotal",
+            "malicious": stats.get("malicious", 0),
+            "suspicious": stats.get("suspicious", 0),
+            "harmless": stats.get("harmless", 0),
+            "detail": f"{stats.get('malicious', 0)} engines flagged this as malicious.",
+        }
+    except requests.RequestException:
+        return None
+
+
+def _query_abuseipdb(ip: str):
+    """Query AbuseIPDB for an IP's abuse confidence score."""
+    try:
+        resp = requests.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            headers={"Key": config.ABUSEIPDB_API_KEY, "Accept": "application/json"},
+            params={"ipAddress": ip, "maxAgeInDays": 90},
+            timeout=config.REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("data", {})
+        return {
+            "service": "AbuseIPDB",
+            "abuse_confidence": data.get("abuseConfidenceScore", 0),
+            "total_reports": data.get("totalReports", 0),
+            "country": data.get("countryCode", "Unknown"),
+            "isp": data.get("isp", "Unknown"),
+            "detail": f"Abuse confidence {data.get('abuseConfidenceScore', 0)}% "
+                      f"from {data.get('totalReports', 0)} reports.",
+        }
+    except requests.RequestException:
+        return None
+
+
+def _query_urlscan(url: str):
+    """Search URLScan.io for existing scans of a URL."""
+    try:
+        resp = requests.get(
+            "https://urlscan.io/api/v1/search/",
+            headers={"API-Key": config.URLSCAN_API_KEY},
+            params={"q": f'page.url:"{url}"', "size": 1},
+            timeout=config.REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        results = resp.json().get("results", [])
+        malicious = bool(results and results[0].get("verdicts", {})
+                         .get("overall", {}).get("malicious"))
+        return {
+            "service": "URLScan.io",
+            "malicious": malicious,
+            "detail": "Recent scan flagged malicious." if malicious
+                      else "No malicious verdict in recent scans.",
+        }
+    except requests.RequestException:
+        return None
+
+
+# ------------------------------------------------------------------ #
+#  Demo / mock lookups (deterministic, offline)
+# ------------------------------------------------------------------ #
+
+# A tiny hard-coded 'known bad' list so demos show clear positives.
+_DEMO_BAD = {
+    "malware-traffic.test", "phishing-example.test", "evil-login.test",
+    "192.0.2.66", "203.0.113.99",
+    "44d88612fea8a8f36de82e1278abb02f",  # EICAR-style demo md5
+}
+_DEMO_SUSPECT = {"free-prize.top", "verify-account.click", "198.51.100.23"}
+
+
+def _demo_lookup(indicator: str, itype: str, note: str = "") -> dict:
+    """
+    Produce deterministic mock results. The verdict is derived from a stable
+    hash of the indicator so the same input always yields the same output.
+    """
+    low = indicator.lower()
+
+    if low in _DEMO_BAD:
+        malicious_reports, blacklisted = 47, True
+        forced = "bad"
+    elif low in _DEMO_SUSPECT:
+        # 10 reports -> risk 40 -> reliably lands in the "Suspicious" band.
+        malicious_reports, blacklisted = 10, False
+        forced = "suspect"
+    else:
+        # Stable pseudo-random verdict from a hash.
+        digest = int(hashlib.sha256(low.encode()).hexdigest(), 16)
+        bucket = digest % 100
+        if bucket < 12:
+            malicious_reports, blacklisted, forced = 30 + bucket, True, "bad"
+        elif bucket < 30:
+            # 9-12 reports -> risk 36-48 -> "Suspicious".
+            malicious_reports, blacklisted, forced = 9 + (bucket % 4), False, "suspect"
+        else:
+            malicious_reports, blacklisted, forced = 0, False, "clean"
+
+    # Fabricate a plausible location for IPs.
+    location = "Unknown"
+    if itype == "ip":
+        countries = ["US", "RU", "CN", "NL", "DE", "BR", "IN", "GB"]
+        location = countries[int(hashlib.md5(low.encode()).hexdigest(), 16) % len(countries)]
+
+    sources = [{
+        "service": "VirusTotal (demo)",
+        "malicious": malicious_reports if forced == "bad" else (malicious_reports if forced == "suspect" else 0),
+        "detail": {
+            "bad": f"{malicious_reports} demo engines flagged this indicator.",
+            "suspect": f"{malicious_reports} demo engines raised low-confidence flags.",
+            "clean": "No demo engines flagged this indicator.",
+        }[forced],
+    }]
+    if itype == "ip":
+        sources.append({
+            "service": "AbuseIPDB (demo)",
+            "detail": f"Demo abuse confidence: {'high' if blacklisted else 'low'}; "
+                      f"country {location}.",
+        })
+
+    result = _assemble(indicator, itype, sources, malicious_reports, location,
+                       blacklisted, demo=True)
+    if note:
+        result["explanation"] = note + " " + result["explanation"]
+    return result
+
+
+# ------------------------------------------------------------------ #
+#  Scoring + verdict assembly (shared by live and demo)
+# ------------------------------------------------------------------ #
+
+def _assemble(indicator, itype, sources, malicious_reports, location,
+              blacklisted, demo):
+    """Turn raw signals into scores, a verdict, and an explanation."""
+    # Risk score: driven by malicious reports and blacklist status.
+    risk = min(malicious_reports * 4, 90)
+    if blacklisted:
+        risk = max(risk, 70)
+    risk = min(risk, 100)
+    reputation = 100 - risk  # higher = safer
+
+    if risk >= 70:
+        verdict = "Malicious"
+        trust = "Do NOT trust this. Avoid interacting with it and block if possible."
+    elif risk >= 35:
+        verdict = "Suspicious"
+        trust = "Treat with caution. Verify through another trusted source before use."
+    else:
+        verdict = "Likely Safe"
+        trust = "No significant threat signals found, but always stay cautious."
+
+    explanation = (
+        f"This {itype} has a reputation score of {reputation}/100. "
+        f"{'It appears on a blacklist. ' if blacklisted else ''}"
+        f"{malicious_reports} malicious report(s) were found. {trust}"
+    )
+
+    return {
+        "indicator": indicator,
+        "indicator_type": itype,
+        "reputation_score": reputation,
+        "risk_score": risk,
+        "verdict": verdict,
+        "blacklisted": blacklisted,
+        "malicious_reports": malicious_reports,
+        "location": location,
+        "sources": sources,
+        "explanation": explanation,
+        "demo": demo,
+    }
