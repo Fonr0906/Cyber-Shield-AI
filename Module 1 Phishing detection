@@ -1,1 +1,389 @@
+"""
+modules/phishing_detection.py
+-----------------------------
+Module 1 - AI Phishing Detection.
 
+Parses pasted email text or an uploaded .eml file and runs a set of
+heuristic (rule-based) checks that mirror how a security analyst triages a
+suspicious message. It produces:
+
+    * a phishing risk score (0-100)
+    * a label: Safe / Suspicious / Dangerous
+    * a list of specific red flags, each with a weight
+    * plain-English recommendations
+
+The scoring is a weighted sum of independent signals, capped at 100. This is a
+transparent, explainable model (no black box) which is exactly what you want
+for a security tool: every point of the score can be traced to a reason.
+"""
+
+import re
+from email import message_from_string, message_from_bytes
+from email.utils import parseaddr, getaddresses
+from urllib.parse import urlparse
+
+# ------------------------------------------------------------------ #
+#  Signal dictionaries
+# ------------------------------------------------------------------ #
+
+# Words/phrases that create false urgency or pressure.
+URGENT_KEYWORDS = [
+    "urgent", "immediately", "action required", "act now", "verify your account",
+    "suspended", "suspension", "unusual activity", "confirm your identity",
+    "your account will be", "within 24 hours", "final notice", "last warning",
+    "failure to", "avoid termination", "limited time", "respond now",
+]
+
+# Words commonly used to bait credential entry.
+CREDENTIAL_KEYWORDS = [
+    "password", "login", "log in", "sign in", "signin", "credentials",
+    "update your payment", "billing information", "confirm your password",
+    "reset your password", "validate your account", "unlock your account",
+]
+
+# Classic lure themes.
+LURE_KEYWORDS = [
+    "you have won", "congratulations", "claim your prize", "gift card",
+    "inheritance", "lottery", "bitcoin", "crypto giveaway", "wire transfer",
+    "invoice attached", "refund", "tax refund", "package could not be delivered",
+]
+
+# File extensions that are risky as email attachments.
+RISKY_EXTENSIONS = {
+    ".exe", ".scr", ".js", ".jse", ".vbs", ".vbe", ".bat", ".cmd", ".com",
+    ".pif", ".jar", ".msi", ".ps1", ".hta", ".wsf", ".lnk", ".iso", ".img",
+}
+
+# Archive types that can hide the above.
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".gz", ".cab"}
+
+# URL shorteners that hide the true destination.
+URL_SHORTENERS = {
+    "bit.ly", "tinyurl.com", "goo.gl", "ow.ly", "t.co", "is.gd", "buff.ly",
+    "cutt.ly", "rebrand.ly", "shorturl.at", "rb.gy",
+}
+
+# TLDs frequently abused for phishing/malware campaigns.
+SUSPICIOUS_TLDS = {
+    ".zip", ".mov", ".xyz", ".top", ".club", ".click", ".link", ".work",
+    ".gq", ".ml", ".cf", ".tk", ".country", ".stream", ".download",
+}
+
+# Domains commonly impersonated (used for look-alike detection).
+POPULAR_BRANDS = [
+    "paypal", "apple", "microsoft", "amazon", "google", "netflix", "facebook",
+    "instagram", "bankofamerica", "wellsfargo", "chase", "dhl", "fedex", "ups",
+    "usps", "coinbase", "linkedin", "office365", "outlook", "docusign",
+]
+
+URL_REGEX = re.compile(r"""https?://[^\s"'<>()]+""", re.IGNORECASE)
+# Matches an <a href="...">visible text</a> so we can compare the two.
+ANCHOR_REGEX = re.compile(
+    r"""<a\s[^>]*href=["']?(?P<href>[^"'>\s]+)["']?[^>]*>(?P<text>.*?)</a>""",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+class PhishingResult:
+    """Simple container for the analysis output."""
+
+    def __init__(self):
+        self.score = 0
+        self.label = "Safe"
+        self.red_flags = []      # list of (description, weight)
+        self.recommendations = []
+        self.sender = ""
+        self.subject = ""
+        self.urls = []
+        self.attachments = []
+
+    def add_flag(self, description, weight):
+        self.red_flags.append({"issue": description, "weight": weight})
+        self.score += weight
+
+    def to_dict(self):
+        return {
+            "score": self.score,
+            "label": self.label,
+            "sender": self.sender,
+            "subject": self.subject,
+            "urls": self.urls,
+            "attachments": self.attachments,
+            "red_flags": self.red_flags,
+            "recommendations": self.recommendations,
+        }
+
+
+# ------------------------------------------------------------------ #
+#  Email parsing
+# ------------------------------------------------------------------ #
+
+def parse_eml_bytes(raw_bytes: bytes) -> dict:
+    """Parse an uploaded .eml file into a normalized dict."""
+    msg = message_from_bytes(raw_bytes)
+    return _message_to_fields(msg)
+
+
+def parse_pasted_text(text: str) -> dict:
+    """
+    Parse pasted email text. If it looks like a full raw email (has headers),
+    parse it as such; otherwise treat the whole thing as the body.
+    """
+    if re.search(r"^(from|subject|to)\s*:", text, re.IGNORECASE | re.MULTILINE):
+        msg = message_from_string(text)
+        return _message_to_fields(msg)
+    return {
+        "from": "",
+        "subject": "",
+        "body": text,
+        "html": text,
+        "attachments": [],
+    }
+
+
+def _message_to_fields(msg) -> dict:
+    """Turn an email.message.Message into plain fields we can analyze."""
+    body_text, body_html, attachments = "", "", []
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            disposition = str(part.get("Content-Disposition", ""))
+            filename = part.get_filename()
+
+            if filename and "attachment" in disposition.lower():
+                attachments.append(filename)
+            elif content_type == "text/plain":
+                body_text += _safe_decode(part)
+            elif content_type == "text/html":
+                body_html += _safe_decode(part)
+    else:
+        payload = _safe_decode(msg)
+        if msg.get_content_type() == "text/html":
+            body_html = payload
+        else:
+            body_text = payload
+
+    return {
+        "from": msg.get("From", ""),
+        "subject": msg.get("Subject", ""),
+        "body": body_text or _strip_html(body_html),
+        "html": body_html or body_text,
+        "attachments": attachments,
+    }
+
+
+def _safe_decode(part) -> str:
+    """Decode a MIME part to text, tolerating bad/missing charsets."""
+    try:
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return ""
+        charset = part.get_content_charset() or "utf-8"
+        return payload.decode(charset, errors="replace")
+    except Exception:
+        return ""
+
+
+def _strip_html(html: str) -> str:
+    """Crude HTML-to-text so keyword checks still work on HTML-only emails."""
+    text = re.sub(r"<[^>]+>", " ", html or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# ------------------------------------------------------------------ #
+#  The analysis
+# ------------------------------------------------------------------ #
+
+def analyze_email(fields: dict) -> PhishingResult:
+    """
+    Run all heuristic checks against the parsed email fields and return a
+    fully populated PhishingResult.
+    """
+    result = PhishingResult()
+    result.sender = fields.get("from", "")
+    result.subject = fields.get("subject", "")
+
+    body = fields.get("body", "") or ""
+    html = fields.get("html", "") or ""
+    combined = f"{result.subject}\n{body}".lower()
+
+    # Collect URLs from both plain text and HTML.
+    urls = set(URL_REGEX.findall(body)) | set(URL_REGEX.findall(html))
+    result.urls = sorted(urls)
+    result.attachments = fields.get("attachments", [])
+
+    _check_sender_spoofing(result)
+    _check_urgent_language(result, combined)
+    _check_credential_bait(result, combined)
+    _check_lures(result, combined)
+    _check_urls(result, result.urls)
+    _check_mismatched_anchors(result, html)
+    _check_brand_lookalikes(result, result.urls, result.sender)
+    _check_attachments(result, result.attachments)
+
+    _finalize(result)
+    return result
+
+
+def _check_sender_spoofing(result: PhishingResult):
+    """Compare the display name against the actual email domain."""
+    display_name, email_addr = parseaddr(result.sender)
+    if not email_addr:
+        if result.sender:  # there is a From line but no parseable address
+            result.add_flag("Sender address is malformed or hidden", 10)
+        return
+
+    domain = email_addr.split("@")[-1].lower()
+
+    # Does the display name mention a brand that doesn't match the domain?
+    lowered_name = display_name.lower()
+    for brand in POPULAR_BRANDS:
+        if brand in lowered_name and brand not in domain:
+            result.add_flag(
+                f"Display name mentions '{brand}' but the real domain is '{domain}' "
+                f"(possible spoofing)",
+                20,
+            )
+            break
+
+    # Freemail domains used for 'official' looking mail are a mild signal.
+    freemail = {"gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "aol.com"}
+    if domain in freemail and any(b in lowered_name for b in POPULAR_BRANDS):
+        result.add_flag(
+            f"A brand-style sender is using a free email domain ({domain})", 12
+        )
+
+
+def _check_urgent_language(result: PhishingResult, text: str):
+    hits = [k for k in URGENT_KEYWORDS if k in text]
+    if hits:
+        weight = min(6 + 3 * len(hits), 18)  # more urgency words = higher weight
+        result.add_flag(
+            f"Urgent / pressuring language detected: {', '.join(hits[:4])}", weight
+        )
+
+
+def _check_credential_bait(result: PhishingResult, text: str):
+    hits = [k for k in CREDENTIAL_KEYWORDS if k in text]
+    if hits:
+        result.add_flag(
+            f"Requests credentials or account action: {', '.join(hits[:4])}", 14
+        )
+
+
+def _check_lures(result: PhishingResult, text: str):
+    hits = [k for k in LURE_KEYWORDS if k in text]
+    if hits:
+        result.add_flag(
+            f"Classic scam lure wording: {', '.join(hits[:3])}", 12
+        )
+
+
+def _check_urls(result: PhishingResult, urls):
+    for url in urls:
+        host = urlparse(url).netloc.lower()
+
+        # Raw IP address instead of a domain.
+        if re.match(r"^\d{1,3}(\.\d{1,3}){3}", host):
+            result.add_flag(f"Link points directly to an IP address: {host}", 15)
+
+        # URL shortener hides the true destination.
+        if any(host == s or host.endswith("." + s) for s in URL_SHORTENERS):
+            result.add_flag(f"Uses a URL shortener that hides the target: {host}", 10)
+
+        # Suspicious / abused TLD.
+        for tld in SUSPICIOUS_TLDS:
+            if host.endswith(tld):
+                result.add_flag(f"Link uses a frequently-abused TLD: {host}", 8)
+                break
+
+        # "@" in the URL is a classic obfuscation trick.
+        if "@" in url.split("//", 1)[-1].split("/", 1)[0]:
+            result.add_flag(f"Link contains '@' to disguise its real host: {url}", 12)
+
+        # Login/verify keywords inside the URL path.
+        if re.search(r"(login|signin|verify|secure|account|update|confirm)", url, re.I):
+            result.add_flag(f"Link mimics a login/verification page: {host}", 8)
+
+
+def _check_mismatched_anchors(result: PhishingResult, html: str):
+    """Detect <a> tags whose visible text URL differs from the real href."""
+    if not html:
+        return
+    for match in ANCHOR_REGEX.finditer(html):
+        href = match.group("href").strip()
+        text = _strip_html(match.group("text")).strip()
+
+        # Only compare when the visible text itself looks like a URL/domain.
+        if re.search(r"[a-z0-9.-]+\.[a-z]{2,}", text, re.I) and href.startswith("http"):
+            visible_host = re.sub(r"^https?://", "", text.lower()).split("/")[0]
+            real_host = urlparse(href).netloc.lower()
+            if visible_host and real_host and visible_host not in real_host:
+                result.add_flag(
+                    f"Link text says '{visible_host}' but actually goes to '{real_host}'",
+                    18,
+                )
+
+
+def _check_brand_lookalikes(result: PhishingResult, urls, sender):
+    """Flag look-alike domains like 'paypa1.com' or 'micros0ft-support.com'."""
+    corpus = " ".join(urls) + " " + sender
+    for brand in POPULAR_BRANDS:
+        # Brand name appears with a digit/hyphen substitution nearby.
+        pattern = re.compile(
+            rf"{brand[0]}[a-z0-9]*{brand[-1]}[a-z0-9]*", re.IGNORECASE
+        )
+        for token in re.findall(r"[a-z0-9.-]+", corpus, re.IGNORECASE):
+            low = token.lower()
+            if brand in low:
+                continue  # exact brand string is handled elsewhere
+            # Look-alike: brand with a number substituted (o->0, l->1, etc.)
+            deleet = low.translate(str.maketrans("013457", "oieast"))
+            if brand in deleet and brand not in low:
+                result.add_flag(
+                    f"Look-alike domain impersonating '{brand}': {token}", 16
+                )
+                break
+
+
+def _check_attachments(result: PhishingResult, attachments):
+    for name in attachments:
+        lower = name.lower()
+        ext = "." + lower.rsplit(".", 1)[-1] if "." in lower else ""
+        # Double extension trick e.g. invoice.pdf.exe
+        if re.search(r"\.(pdf|doc|docx|jpg|png|xls|xlsx)\.[a-z0-9]{2,4}$", lower):
+            result.add_flag(f"Attachment uses a double extension: {name}", 20)
+        elif ext in RISKY_EXTENSIONS:
+            result.add_flag(f"Dangerous executable attachment: {name}", 22)
+        elif ext in ARCHIVE_EXTENSIONS:
+            result.add_flag(f"Archive attachment may hide malware: {name}", 8)
+
+
+def _finalize(result: PhishingResult):
+    """Cap the score, assign a label, and build recommendations."""
+    result.score = min(result.score, 100)
+
+    if result.score >= 60:
+        result.label = "Dangerous"
+    elif result.score >= 30:
+        result.label = "Suspicious"
+    else:
+        result.label = "Safe"
+
+    # Tailored, plain-English advice.
+    recs = []
+    if result.label == "Dangerous":
+        recs.append("Do NOT click any links or open any attachments in this email.")
+        recs.append("Do not reply or provide any personal or account information.")
+        recs.append("Report the message to your IT/security team or email provider.")
+        recs.append("Delete the email after reporting it.")
+    elif result.label == "Suspicious":
+        recs.append("Treat this email with caution and verify the sender independently.")
+        recs.append("Hover over links to inspect the real destination before clicking.")
+        recs.append("Contact the organization directly using a known, official channel.")
+    else:
+        recs.append("No strong phishing signals were detected, but stay alert.")
+        recs.append("Always verify unexpected requests for money or credentials.")
+
+    if result.attachments:
